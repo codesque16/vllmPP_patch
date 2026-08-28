@@ -251,13 +251,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "dspark",
                 "extract_hidden_states",
             ):
-                # Drafting may require auxiliary hidden states from target model outputs
-                self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
-                    )
+                # Drafting may require auxiliary hidden states from target model
+                # outputs. DSpark + PP: speculator is last-rank only, so capture
+                # aux hidden only there. Earlier ranks must still return
+                # IntermediateTensors for the PP send (not a (hidden, aux) tuple).
+                if self.speculative_config.method == "dspark" and self.use_pp:
+                    self.use_aux_hidden_state_outputs = self.is_last_pp_rank
+                else:
+                    self.use_aux_hidden_state_outputs = True
+                    if self.use_pp:
+                        raise ValueError(
+                            f"{self.speculative_config.method} with pipeline parallel "
+                            "is not supported."
+                        )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)

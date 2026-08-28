@@ -21,6 +21,7 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
+    c128a_batch_topk_width,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
@@ -810,6 +811,17 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             if attn_metadata is None:
                 raise RuntimeError("C128A prefill metadata is missing.")
             local_topk_indices = attn_metadata.c128a_prefill_topk_indices
+            # Decode CUDA graphs keep the full c128a_max_compressed extra_topk
+            # (stable shape). Prefill is eager; passing the 1M-context width
+            # (8192) into compute_global_topk / SM120 paged attention IMAs.
+            local_topk_indices = local_topk_indices[
+                :,
+                : c128a_batch_topk_width(
+                    attn_metadata.max_seq_len,
+                    self.compress_ratio,
+                    local_topk_indices.shape[-1],
+                ),
+            ]
 
         extra_sparse_indices: torch.Tensor | None = None
         extra_sparse_lengths: torch.Tensor | None = None
@@ -823,14 +835,22 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             prefill_token_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
+            req_indices = swa_metadata.token_to_req_indices[prefill_token_slice]
+            is_valid = swa_metadata.is_valid_token[prefill_token_slice]
+            if local_topk_indices.shape[0] != req_indices.shape[0]:
+                raise RuntimeError(
+                    "C128A prefill topk rows "
+                    f"({local_topk_indices.shape[0]}) != SWA prefill tokens "
+                    f"({req_indices.shape[0]})"
+                )
             block_size = attn_metadata.block_size // self.compress_ratio
             extra_sparse_indices, extra_sparse_lengths = (
                 compute_global_topk_indices_and_lens(
                     local_topk_indices,
-                    swa_metadata.token_to_req_indices[prefill_token_slice],
+                    req_indices,
                     attn_metadata.block_table,
                     block_size,
-                    swa_metadata.is_valid_token[prefill_token_slice],
+                    is_valid,
                 )
             )
 

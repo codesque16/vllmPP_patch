@@ -32,6 +32,21 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _C128A_TOPK_ALIGNMENT = 128
 
 
+def c128a_batch_topk_width(
+    max_seq_len: int, compress_ratio: int, cap: int
+) -> int:
+    """FlashInfer-facing C128A extra_topk for this batch.
+
+    Buffer rows stay ``cap`` (= ``c128a_max_compressed``) wide so CUDA graphs
+    keep a stable decode shape. Prefill should slice to this width: the
+    DeepSeek-V4-Flash HF default ``max_position_embeddings=1048576`` makes
+    ``cap=8192``, and SM120's prefill orchestrator IMAs at that extra_topk.
+    """
+    needed = max(max_seq_len // compress_ratio, 1)
+    width = max(triton.next_power_of_2(needed), _C128A_TOPK_ALIGNMENT)
+    return min(width, cap)
+
+
 class DeepseekV4SparseMLABackend(AttentionBackend):
     """DeepSeek-V4 sparse-MLA backend base.
 
@@ -242,13 +257,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
         assert cm.positions is not None, (
             "positions is required for C128A metadata build"
         )
-        active_topk_width = min(
-            max(
-                triton.next_power_of_2(max(cm.max_seq_len // self.compress_ratio, 1)),
-                _C128A_TOPK_ALIGNMENT,
-            ),
-            self.c128a_max_compressed,
-        )
+        active_topk_width = self.c128a_max_compressed
         assert active_topk_width >= cm.max_seq_len // self.compress_ratio
         assert active_topk_width % _C128A_TOPK_ALIGNMENT == 0
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
@@ -389,9 +398,10 @@ def _build_c128a_topk_metadata_kernel(
             is_valid = offset < num_compressed
 
             block_indices = offset // block_size
+            in_table = is_valid & (block_indices < block_table_stride)
             block_numbers = tl.load(
                 block_table_ptr + req_idx * block_table_stride + block_indices,
-                mask=mask & is_valid,
+                mask=mask & in_table,
             )
             block_offsets = offset % block_size
             slot_ids = block_numbers * block_size + block_offsets
