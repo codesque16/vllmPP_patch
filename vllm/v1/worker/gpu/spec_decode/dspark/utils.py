@@ -85,8 +85,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_inner = draft_model.model
     target_vocab_size = vllm_config.model_config.get_vocab_size()
 
-    # Skip embedding sharing under PP — each rank owns its own embedding
-    # (same as Eagle). Drafter only runs on the last PP rank.
+    # Skip embedding sharing under PP — last-rank target embed_tokens is
+    # PPMissingLayer. Drafter only runs on the last PP rank; load_weights
+    # reads the checkpoint embedding table instead of aliasing.
     if get_pp_group().world_size == 1:
         target_embed = getattr(target_inner, "embed_tokens", None)
         draft_embed = getattr(draft_inner, "embed_tokens", None)
@@ -100,6 +101,12 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if draft_embed is not None:
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
+    else:
+        logger.info(
+            "DSpark PP=%d: last rank cannot alias target embed_tokens; "
+            "draft load_weights will read the checkpoint embedding table.",
+            get_pp_group().world_size,
+        )
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(draft_model, "lm_head", None)
